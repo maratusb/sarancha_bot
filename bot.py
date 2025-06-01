@@ -2,19 +2,23 @@ import os
 import logging
 from dotenv import load_dotenv
 from supabase import create_client
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InputFile
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters, ConversationHandler
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
-import csv
+import mimetypes
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "255357009"))  # Только вы можете экспортировать
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -24,62 +28,72 @@ user_data = {}
 logging.basicConfig(level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Пожалуйста, отправьте фото саранчи.")
+    await update.message.reply_text("Привет! Отправь фото или видео саранчи.")
     return PHOTO
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    photo_file = await update.message.photo[-1].get_file()
-    file_path = f"{user_id}_{photo_file.file_unique_id}.jpg"
-    await photo_file.download_to_drive(file_path)
-    user_data[user_id] = {"photo_path": file_path}
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        ext = ".jpg"
+    elif update.message.video:
+        file = await update.message.video.get_file()
+        ext = ".mp4"
+    else:
+        await update.message.reply_text("Отправь фото или видео.")
+        return PHOTO
 
-    button = KeyboardButton(text="📍 ОТПРАВИТЬ МОЁ МЕСТОПОЛОЖЕНИЕ", request_location=True)
+    file_path = f"{user_id}_{file.file_unique_id}{ext}"
+    await file.download_to_drive(file_path)
+    user_data[user_id] = {"file_path": file_path}
+
+    button = KeyboardButton("📍 Отправить геолокацию", request_location=True)
     keyboard = ReplyKeyboardMarkup([[button]], resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text(
-        "Теперь отправьте ваше местоположение — нажмите большую кнопку ниже:",
-        reply_markup=keyboard
-    )
+    await update.message.reply_text("Теперь отправь местоположение:", reply_markup=keyboard)
     return LOCATION
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     location = update.message.location
     if not location:
-        await update.message.reply_text("Пожалуйста, используйте кнопку для отправки местоположения.")
+        await update.message.reply_text("Используй кнопку геолокации.")
         return LOCATION
     user_data[user_id]["latitude"] = location.latitude
     user_data[user_id]["longitude"] = location.longitude
-    await update.message.reply_text("Добавьте комментарий (например, тип саранчи или описание ситуации):")
+    await update.message.reply_text("Добавь комментарий (тип саранчи, описание и т.п.):")
     return COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     comment = update.message.text
-    data = user_data[user_id]
+    data = user_data.get(user_id)
+    if not data:
+        await update.message.reply_text("Ошибка. Начни сначала командой /start")
+        return ConversationHandler.END
+
     data["comment"] = comment
 
     try:
-        with open(data["photo_path"], "rb") as f:
-            photo_filename = os.path.basename(data["photo_path"])
-            supabase.storage.from_("photos").upload(photo_filename, f, {"x-upsert": "true"})
+        with open(data["file_path"], "rb") as f:
+            filename = os.path.basename(data["file_path"])
+            supabase.storage.from_("photos").upload(filename, f, {"x-upsert": "true"})
 
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/photos/{photo_filename}"
-
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/photos/{filename}"
         supabase.table("reports").insert({
             "latitude": data["latitude"],
             "longitude": data["longitude"],
-            "comment": comment,
-            "photo_url": public_url
+            "comment": data["comment"],
+            "photo_url": public_url,
+            "user_id": str(user_id),
         }).execute()
 
-        await update.message.reply_text("✅ Спасибо! Данные успешно сохранены.")
+        await update.message.reply_text("✅ Спасибо! Всё загружено.")
     except Exception as e:
-        await update.message.reply_text("❌ Ошибка при сохранении данных.")
-        print("Ошибка:", e)
+        await update.message.reply_text("❌ Ошибка при сохранении в Supabase.")
+        print("❌", e)
 
     try:
-        os.remove(data["photo_path"])
+        os.remove(data["file_path"])
     except:
         pass
 
@@ -87,32 +101,34 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ У вас нет прав для экспорта данных.")
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("🚫 Только админ может экспортировать данные.")
         return
-
     try:
-        data = supabase.table("reports").select("*").execute().data
-        if not data:
-            await update.message.reply_text("Нет данных для экспорта.")
+        res = supabase.table("reports").select("*").execute()
+        rows = res.data
+        if not rows:
+            await update.message.reply_text("Пока нет данных.")
             return
-
-        filename = "locust_reports.csv"
-        with open(filename, "w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=["id", "created_at", "latitude", "longitude", "comment", "photo_url"])
-            writer.writeheader()
-            for row in data:
-                writer.writerow(row)
-
-        await update.message.reply_document(InputFile(filename))
-        os.remove(filename)
+        csv_data = "id,created_at,latitude,longitude,comment,photo_url\n"
+        for r in rows:
+            csv_data += f'{r["id"]},{r["created_at"]},{r["latitude"]},{r["longitude"]},"{r["comment"]}",{r["photo_url"]}\n'
+        with open("export.csv", "w", encoding="utf-8") as f:
+            f.write(csv_data)
+        await update.message.reply_document(open("export.csv", "rb"))
+        os.remove("export.csv")
     except Exception as e:
-        await update.message.reply_text("Ошибка при экспорте данных.")
-        print("Export error:", e)
+        await update.message.reply_text("❌ Ошибка экспорта.")
+        print("❌", e)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text("✅ Бот запущен и работает.")
+    else:
+        await update.message.reply_text("⛔ Нет доступа.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Операция отменена.")
+    await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
 if __name__ == "__main__":
@@ -121,7 +137,7 @@ if __name__ == "__main__":
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            PHOTO: [MessageHandler(filters.PHOTO, handle_photo)],
+            PHOTO: [MessageHandler(filters.PHOTO | filters.VIDEO, handle_media)],
             LOCATION: [MessageHandler(filters.LOCATION, handle_location)],
             COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
         },
@@ -130,4 +146,5 @@ if __name__ == "__main__":
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("export", export_data))
+    app.add_handler(CommandHandler("status", status))
     app.run_polling()
